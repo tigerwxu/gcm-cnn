@@ -24,7 +24,20 @@ batch_size: int = 10
 
 max_training_epochs: int = 200
 
-CMD_HELP : str = """--placeholder--"""
+CMD_HELP : str = """Options:
+--cuda
+    uses nVidia CUDA acceleration for tensor calculations (recommended)
+--batch-size <batch size>
+    sets the mini-batch size to use for training. Defaults to 10 if not supplied
+--gcms-path <folder/directory path>
+    sets the path for the GCM CSV files to use as input. Defaults to ./gcms if not supplied
+--targets_path <folder/directory path>
+    sets the path for the CSV files that contains the "cat5" class label column. Defaults to ./targets if not supplied. Note that a model is trained for each file that is found.
+--validation_percentage
+    sets the percentage of instances to use as the validation set
+--test_percentage
+    sets the percentage of instances to use as the final test set
+"""
 
 torch.set_printoptions(precision = 10)
 
