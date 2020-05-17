@@ -2,14 +2,29 @@ import torch
 import numpy
 import pandas
 import sys
+import os
+import copy
 
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-train_folder_path : str = "test"
-test_folder_path : str= "train"
+#Global option defaults that can be changed later by command line
+gcm_folder_path : str = "gcms"
+target_folder_path : str = "targets"
+class_index = "cat5"
 
+use_cuda : bool = False
+
+train_split: float = 0.8
+test_split: float = 0.1
+validation_split: float = 0.1
+
+batch_size: int = 10
+
+max_training_epochs: int = 200
+
+CMD_HELP : str = """--placeholder--"""
 
 torch.set_printoptions(precision = 10)
 
@@ -20,20 +35,83 @@ def normalise(t: torch.tensor):
     return t
 
 def parse_command_line():
-    i = 1
-    print(sys.argv)
+    i = 1 #sys.argv[0] contains the script name itself and can be ignored
     while i < len(sys.argv):
-        if sys.argv[i] == "-t":
+        if sys.argv[i] == "-h" or sys.argv[i] == "--help":
+            print(CMD_HELP)
+            sys.exit()
+        elif sys.argv[i] == "--gcms-path":
             i += 1
-            train_folder_path = sys.argv[i]
-        elif sys.argv[i] == "-T":
+            global gcm_folder_path
+            gcm_folder_path = sys.argv[i]
+        elif sys.argv[i] == "--classlabel":
             i += 1
-            test_folder_path = sys.argv[i]
-        i += 1    
+            global class_index
+            class_index = sys.argv[i]
+        elif sys.argv[i] == "--cuda":
+            global use_cuda
+            use_cuda = True
+        elif sys.argv[i] == "--targets-path":
+            i += 1
+            global target_folder_path
+            target_folder_path = sys.argv[i]
+        elif sys.argv[i] == "--test-percentage":
+            i += 1
+            global test_split
+            test_percentage = float(sys.argv[i]) / 100.0
+        elif sys.argv[i] == "--validation-percentage":
+            i += 1
+            global validation_split
+            validation_percentage = float(sys.argv[i]) / 100.0
+        elif sys.argv[i] == "--batch-size":
+            i += 1
+            global batch_size
+            batch_size = int(sys.argv[i])
+        elif sys.argv[i] == "--max-epochs":
+            i += 1
+            global max_training_epochs
+            max_training_epochs = int(sys.argv[i])
+        else:
+            print("Unknown argument: " + sys.argv[i] + "\n Use \"gcm-cnn -h\" to see valid commands")
+            sys.exit()
+        i += 1
+    global train_split
+    train_split = 1.0 - test_split - validation_split
+    assert(train_split > 0), "No instances left for training. Did the sum of your test and validation holdout percentages exceed 100%?"
+    assert(batch_size > 0), "Batch size can't be negative!!!"
+
+def read_gcm_folder(path: str): #returns a folder of GCM CSVs as a 4-channel PyTorch Tensors
+    filenames = os.listdir(path)
+    files = []
+    for i in range(0, len(filenames)):
+        nextfile =  pandas.read_csv((path + "/" + filenames[i]), sep=",", skiprows=3, header=None) #explicitly skip 3 rows to discard header, longitude, latitude
+        nextfile = nextfile.drop(nextfile.columns[0], axis=1)
+        nextfile = torch.from_numpy(nextfile.values).type(torch.FloatTensor)
+        if use_cuda == True:
+            nextfile = nextfile.cuda()
+        nextfile = nextfile.reshape(288,131,360)
+        nextfile = normalise(nextfile)
+        files.append(nextfile)
+        
+    return torch.stack(files, dim=1)
+
+def read_target_folder(path: str): #returns a folder of CSVs containing the class label as a list of PyTorch Tensors
+    filenames = os.listdir(path)
+    files = []
+    for i in range(0, len(filenames)):
+        nextfile = pandas.read_csv((path + "/" + filenames[i]), sep=",")
+        nextfile = nextfile[class_index] + 2
+        nextfile = torch.from_numpy(nextfile.values).type(torch.LongTensor)
+        if use_cuda == True:
+            nextfile = nextfile.cuda()
+        files.append(nextfile)
+
+    return files
+
 class Network(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=6, kernel_size=5)
+        self.conv1 = nn.Conv2d(in_channels=len(os.listdir(gcm_folder_path)), out_channels=6, kernel_size=5)
         self.conv2 = nn.Conv2d(in_channels=6, out_channels=12, kernel_size=5)
         
         self.fc1 = nn.Linear(in_features= 30276, out_features=120)
@@ -76,115 +154,83 @@ class Network(nn.Module):
 
         return t
 
-
+#Setting options from command line
 parse_command_line()
-print(train_folder_path)
 
-targetFilePath : str = "data/Target_TMean_NNI_regional_ave_time_series.csv"
+#print(target_tensors[0].size()[0])
+#Reading files from disk into PyTorch tensors
+label_tensors = read_target_folder(target_folder_path)
+gcm_tensor = read_gcm_folder(gcm_folder_path)
 
-#reading in labels from target CSV
-labels = pandas.read_csv(targetFilePath, sep=",", skiprows=1, header=None)
-labels = labels[labels.columns[3]].astype(int) #cat5 column - so 5 prediction classes
+#Split the gcm_tensor into train, validation, test tensors
+instances = gcm_tensor.size()[0]
+train_tensor = gcm_tensor[:int(instances * train_split)] #note int() truncates/floors
+validation_tensor = gcm_tensor[int(instances * train_split):int(instances * (train_split + validation_split))]
+test_tensor = gcm_tensor[int(instances * (train_split + validation_split)):]
 
-#Reading in GCM CSVs with pandas
-precip = pandas.read_csv("data/PRECIP_1993_2016_ecmwf.csv", sep=",", skiprows=3, header=None)
-precip = precip.drop(precip.columns[0], axis=1)
 
-t2m = pandas.read_csv("data/T2M_1993_2016_ecmwf.csv", sep=",", skiprows=3, header=None)
-t2m = t2m.drop(t2m.columns[0], axis=1)
 
-z850 = pandas.read_csv("data/Z850_1993_2016_ecmwf.csv", sep=",", skiprows=4, header=None)
-z850 = z850.drop(z850.columns[0], axis=1)
+#Now we set up a loop to train a network for each label file that was present
+for n in range(0, len(label_tensors)):
+    
+    #Creating pytorch dataset and dataloader for easy access to minibatch sampling without replacement in randomnised order
+    train_set = torch.utils.data.TensorDataset(train_tensor, (label_tensors[n])[ : int(instances * train_split)])
+    train_loader = torch.utils.data.DataLoader(train_set, batch_size = batch_size, shuffle=True)
+    validation_set = torch.utils.data.TensorDataset(validation_tensor, (label_tensors[n])[int(instances * train_split) : int(instances * (train_split + validation_split))])
+    validation_loader = torch.utils.data.DataLoader(validation_set, batch_size=validation_tensor.size()[0], shuffle = False)
+    test_set = torch.utils.data.TensorDataset(test_tensor, (label_tensors[n])[int(instances * (train_split + validation_split)) : ])
+    test_loader = torch.utils.data.DataLoader(test_set, batch_size = test_tensor.size()[0], shuffle = False)
 
-#converting to pytorch tensors
-labelsTensor = (torch.from_numpy(labels.values).type(torch.LongTensor) + 2).cuda() #cat5 in form -2, -1, 0, 1, 2; we want 0 to 5 for brevity
-precip = torch.from_numpy(precip.values).type(torch.FloatTensor)
-t2m = torch.from_numpy(t2m.values).type(torch.FloatTensor)
-z850 = torch.from_numpy(z850.values).type(torch.FloatTensor)
+    #Initialising the CNN and gradient descender (optimizer)
+    network = Network()
+    if use_cuda == True:
+        network = network.cuda()
+    optimizer = optim.SGD(network.parameters(), lr = 0.01)
 
-#Unflattening GCMs
-precip = precip.reshape(288, 131, 360)
-t2m = t2m.reshape(288, 131, 360)
-z850 = z850.reshape(288, 131, 360)
+    #running the training loop
+    epoch_correct : int = 0
+    epoch_loss : float = 0
+    lowest_valid_loss : float = float('inf')
+    epochs_without_improvement = 0
+    best_network = copy.deepcopy(network)
 
-#normalising GCMs
-precip = normalise(precip)
-t2m = normalise(t2m)
-z850 = normalise(z850)
+    print("results for", os.listdir(target_folder_path)[n])
+    for epoch in range(0, max_training_epochs):
+        previous_epoch_loss = epoch_loss
+        epoch_correct = 0
+        epoch_loss = 0
 
-#Stacking each GCM of each variable as a channel of the input tensor
-dataTensor = torch.stack([precip, t2m, z850], dim=1).cuda()
+        for images, labels in train_loader:
+            #Getting predictions before any training on this batch has occurred
+            predictions = network(images)
+            loss = F.cross_entropy(predictions, labels)
 
-#Code for plotting input as greyscale images and combining into a single RGB image
-"""pyplot.imshow(precip[0], cmap="gray")
-pyplot.show()
-pyplot.imshow(t2m[0], cmap="gray")
-pyplot.show()
-pyplot.imshow(z850[0], cmap="gray")
-pyplot.show()
-pyplot.imshow(dataTensor[0].cpu().permute(1, 2, 0))
-pyplot.show()"""
+            #making the gradient step for this batch
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-#Split the dataTensor into training and test tensors for explicit holdout
-trainTensor = dataTensor[:250]
-testTensor = dataTensor[250:] #38/288 for testing, or about 13.2%
+            epoch_correct += predictions.argmax(dim=1).eq(labels).int().sum().item() 
+            epoch_loss += loss.item()
 
-#Creating pytorch dataset and dataloader for easy access to minibatch sampling without replacement in randomnised order
-trainset = torch.utils.data.TensorDataset(trainTensor, labelsTensor[:250])
-trainloader = torch.utils.data.DataLoader(trainset, batch_size=10, shuffle=True)
-testset = torch.utils.data.TensorDataset(testTensor, labelsTensor[250:])
-testloader = torch.utils.data.DataLoader(testset, batch_size=38, shuffle=False)
 
-#Initialising the CNN and gradient descender (optimizer)
-network = Network()
-network.cuda()
-optimizer = optim.SGD(network.parameters(), lr = 0.01)
+        valid_preds = network(validation_tensor)
+        valid_loss = F.cross_entropy(valid_preds, label_tensors[n][int(instances * train_split) : int(instances * (train_split + validation_split))])
 
-epochLossSum = 0
-for epoch in range(0, 250):
-    batchNo = 0
-    epochCorrect = 0
-    prevloss = epochLossSum
-    epochLossSum = 0
+        if (lowest_valid_loss > valid_loss) :
+            lowest_valid_loss = valid_loss
+            best_network = copy.deepcopy(network)
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
 
-    for images, labels in trainloader: #shuffled minibatches
-        batchNo += 1
-        preds0 = network(images)
-        loss0 = F.cross_entropy(preds0, labels)  #loss on this batch before gradient descent
+        if (epochs_without_improvement > 10) :
+            print("stopping early")
+            break
 
-        optimizer.zero_grad()
-        loss0.backward() #this call updates the gradients in network
-        optimizer.step()
-        preds1 = network(images)
-        loss1 = F.cross_entropy(preds1, labels) #loss on this batch after gradient descent (expect decrease)
-        
-        #nb loss0, preds0 are loss and predictions before training on this batch, loss1, pred1 are after training on this batch (needed to see how much of a difference this batch made)
-
-        epochLossSum += loss0.item()
-        epochCorrect += preds0.argmax(dim=1).eq(labels).int().sum().item()
-        #print("Minibatch ", batchNo, ":\t", round(loss0.item(), 5), "(before gd)\t", round(loss1.item(), 5), "(after gd)\t", preds1.argmax(dim=1).eq(labels).int().sum().item(), " (correct predictions)", sep = "" )
-
-    print("epoch", epoch, "\tloss: ", round(epochLossSum,5), "\tdifference: " , round(epochLossSum - prevloss, 5) , "\t%correct:", round((100 * epochCorrect / 250), 3), sep="")
-    if (epochCorrect / 250 * 100) > 99:
-        break
-
-for images, labels in testloader:
-    preds = network(images)
-    correct = preds.argmax(dim=1).eq(labels).int().sum().item()
-    #print(testpreds.argmax(dim=1))
-    #print(labels)
-    print("result:", correct, "/ 38")
-    print("test correct %:", 100 * correct / 38.0)
-
-    '''
-    confusionStack = torch.stack((labels, preds.argmax(dim=1)), dim=1)
-    confusionMatrix = torch.zeros(5, 5, dtype=torch.int64).cuda()
-    for p in confusionStack:
-        tl, pl = p.tolist()
-        confusionMatrix[tl, pl] = confusionMatrix[tl, pl] + 1
-    pyplot.figure(figsize=(10,10))
-    plot_confusion_matrix(confusionMatrix.cpu(), ('-2', '-1', '0', '1', '2'))
-    pyplot.show()
-    '''
-print("END")
-
+        print("epoch: ", epoch, "\ttrain_loss: ", round(epoch_loss, 5), "\ttrain_correct: ", epoch_correct, "\tvalidation_loss: ", round(valid_loss.item(),5), sep='' )
+    
+    test_preds = best_network(test_tensor)
+    test_loss = F.cross_entropy(test_preds, label_tensors[n][int(instances * (train_split + validation_split)) : ])
+    test_correct = test_preds.argmax(dim=1).eq(label_tensors[n][int(instances * (train_split + validation_split)) : ]).int().sum().item() 
+    print("test_correct: ", test_correct, "/", test_preds.size()[0],  "\ttest_loss: ", round(test_loss.item(), 5), sep='' )
